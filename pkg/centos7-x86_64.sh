@@ -2,9 +2,9 @@
 
 OUTPUT_DIR=$PWD
 
-SOURCE_DIR=$(readlink -f $(dirname ${BASH_SOURCE[0]}))
+SOURCE_DIR=$(readlink -f $(dirname ${BASH_SOURCE[0]})/..)
 
-VERSION=$(cd "$SOURCE_DIR" && git describe --tags --abbrev=8 --dirty | tr - .)
+VERSION=$(cd "$SOURCE_DIR" && git describe --tags --abbrev=8 --dirty | tr - .)~upstream_centos7
 
 DOCKER_TAG=$(docker build -q - <<EOS
 FROM centos:7
@@ -63,7 +63,7 @@ make
 
 %files
 %{_bindir}/laminarc
-%{_bindir}/laminard
+%{_sbindir}/laminard
 %{_unitdir}/laminar.service
 %config(noreplace) %{_sysconfdir}/laminar.conf
 %{_datarootdir}/bash-completion/completions/laminarc
@@ -72,7 +72,7 @@ make
 %post
 echo Creating laminar user with home in %{_sharedstatedir}/laminar
 useradd -r -d %{_sharedstatedir}/laminar -s %{_sbindir}/nologin laminar
-mkdir -p %{_sharedstatedir}/laminar/cfg/{jobs,nodes,scripts}
+mkdir -p %{_sharedstatedir}/laminar/cfg/{jobs,contexts,scripts}
 chown -R laminar: %{_sharedstatedir}/laminar
 EOF
 

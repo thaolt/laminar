@@ -20,6 +20,8 @@
 #include "server.h"
 #include "conf.h"
 #include "log.h"
+#include "http.h"
+#include "rpc.h"
 
 #include <sys/wait.h>
 #include <sys/mman.h>
@@ -35,7 +37,7 @@
 #include <rapidjson/writer.h>
 
 // rapidjson::Writer with a StringBuffer is used a lot in Laminar for
-// preparing JSON messages to send to Websocket clients. A small wrapper
+// preparing JSON messages to send to HTTP clients. A small wrapper
 // class here reduces verbosity later for this common use case.
 class Json : public rapidjson::Writer<rapidjson::StringBuffer> {
 public:
@@ -52,13 +54,6 @@ template<> Json& Json::set(const char* key, double value) { String(key); Double(
 template<> Json& Json::set(const char* key, const char* value) { String(key); String(value); return *this; }
 template<> Json& Json::set(const char* key, std::string value) { String(key); String(value.c_str()); return *this; }
 
-namespace {
-// Default values when none were supplied in $LAMINAR_CONF_FILE (/etc/laminar.conf)
-constexpr const char* INTADDR_RPC_DEFAULT = "unix-abstract:laminar";
-constexpr const char* INTADDR_HTTP_DEFAULT = "*:8080";
-constexpr const char* ARCHIVE_URL_DEFAULT = "/archive/";
-}
-
 // short syntax helpers for kj::Path
 template<typename T>
 inline kj::Path operator/(const kj::Path& p, const T& ext) {
@@ -71,18 +66,24 @@ inline kj::Path operator/(const std::string& p, const T& ext) {
 
 typedef std::string str;
 
-Laminar::Laminar(const char *home) :
-    homePath(kj::Path::parse(&home[1])),
-    fsHome(kj::newDiskFilesystem()->getRoot().openSubdir(homePath, kj::WriteMode::MODIFY))
+Laminar::Laminar(Server &server, Settings settings) :
+    settings(settings),
+    srv(server),
+    homePath(kj::Path::parse(&settings.home[1])),
+    fsHome(kj::newDiskFilesystem()->getRoot().openSubdir(homePath, kj::WriteMode::MODIFY)),
+    http(kj::heap<Http>(*this)),
+    rpc(kj::heap<Rpc>(*this))
 {
-    LASSERT(home[0] == '/');
+    LASSERT(settings.home[0] == '/');
 
-    archiveUrl = ARCHIVE_URL_DEFAULT;
-    if(char* envArchive = getenv("LAMINAR_ARCHIVE_URL")) {
-        archiveUrl = envArchive;
-        if(archiveUrl.back() != '/')
-            archiveUrl.append("/");
+    if(fsHome->exists(homePath/"cfg"/"nodes")) {
+        LLOG(ERROR, "Found node configuration directory cfg/nodes. Nodes have been deprecated, please migrate to contexts. Laminar will now exit.");
+        exit(EXIT_FAILURE);
     }
+
+    archiveUrl = settings.archive_url;
+    if(archiveUrl.back() != '/')
+        archiveUrl.append("/");
 
     numKeepRunDirs = 0;
 
@@ -103,27 +104,21 @@ Laminar::Laminar(const char *home) :
         buildNums[name] = build;
     });
 
-    srv = nullptr;
+    srv.watchPaths([this]{
+        LLOG(INFO, "Reloading configuration");
+        loadConfiguration();
+        // config change may allow stuck jobs to dequeue
+        assignNewJobs();
+    }).addPath((homePath/"cfg"/"contexts").toString(true).cStr())
+      .addPath((homePath/"cfg"/"jobs").toString(true).cStr())
+      .addPath((homePath/"cfg").toString(true).cStr()); // for groups.conf
+
+    srv.listenRpc(*rpc, settings.bind_rpc);
+    srv.listenHttp(*http, settings.bind_http);
 
     // Load configuration, may be called again in response to an inotify event
     // that the configuration files have been modified
     loadConfiguration();
-}
-
-void Laminar::registerClient(LaminarClient* client) {
-    clients.insert(client);
-}
-
-void Laminar::deregisterClient(LaminarClient* client) {
-    clients.erase(client);
-}
-
-void Laminar::registerWaiter(LaminarWaiter *waiter) {
-    waiters.insert(waiter);
-}
-
-void Laminar::deregisterWaiter(LaminarWaiter *waiter) {
-    waiters.erase(waiter);
 }
 
 uint Laminar::latestRun(std::string job) {
@@ -141,8 +136,6 @@ uint Laminar::latestRun(std::string job) {
     }
 }
 
-// TODO: reunify with sendStatus. The difference is that this method is capable of
-// returning "not found" to the caller, and sendStatus isn't
 bool Laminar::handleLogRequest(std::string name, uint num, std::string& output, bool& complete) {
     if(Run* run = activeRun(name, num)) {
         output = run->log;
@@ -216,40 +209,15 @@ void Laminar::populateArtifacts(Json &j, std::string job, uint num) const {
     }
 }
 
-void Laminar::sendStatus(LaminarClient* client) {
-    if(client->scope.type == MonitorScope::LOG) {
-        // If the requested job is currently in progress
-        if(const Run* run = activeRun(client->scope.job, client->scope.num)) {
-            client->sendMessage(run->log.c_str());
-        } else { // it must be finished, fetch it from the database
-            db->stmt("SELECT output, outputLen FROM builds WHERE name = ? AND number = ?")
-              .bind(client->scope.job, client->scope.num)
-              .fetch<str,int>([=](str maybeZipped, unsigned long sz) {
-                str log(sz+1,'\0');
-                if(sz >= COMPRESS_LOG_MIN_SIZE) {
-                    int res = ::uncompress((uint8_t*) log.data(), &sz,
-                         (const uint8_t*) maybeZipped.data(), maybeZipped.size());
-                    if(res == Z_OK)
-                        client->sendMessage(log);
-                    else
-                        LLOG(ERROR, "Failed to uncompress log");
-                } else {
-                    client->sendMessage(maybeZipped);
-                }
-            });
-            client->notifyJobFinished();
-        }
-        return;
-    }
-
+std::string Laminar::getStatus(MonitorScope scope) {
     Json j;
     j.set("type", "status");
     j.set("title", getenv("LAMINAR_TITLE") ?: "Laminar");
     j.set("time", time(nullptr));
     j.startObject("data");
-    if(client->scope.type == MonitorScope::RUN) {
+    if(scope.type == MonitorScope::RUN) {
         db->stmt("SELECT queuedAt,startedAt,completedAt,result,reason,parentJob,parentBuild FROM builds WHERE name = ? AND number = ?")
-        .bind(client->scope.job, client->scope.num)
+        .bind(scope.job, scope.num)
         .fetch<time_t, time_t, time_t, int, std::string, std::string, uint>([&](time_t queued, time_t started, time_t completed, int result, std::string reason, std::string parentJob, uint parentBuild) {
             j.set("queued", started-queued);
             j.set("started", started);
@@ -258,7 +226,7 @@ void Laminar::sendStatus(LaminarClient* client) {
             j.set("reason", reason);
             j.startObject("upstream").set("name", parentJob).set("num", parentBuild).EndObject(2);
         });
-        if(const Run* run = activeRun(client->scope.job, client->scope.num)) {
+        if(const Run* run = activeRun(scope.job, scope.num)) {
             j.set("queued", run->startedAt - run->queuedAt);
             j.set("started", run->startedAt);
             j.set("result", to_string(RunState::RUNNING));
@@ -270,30 +238,30 @@ void Laminar::sendStatus(LaminarClient* client) {
                 j.set("etc", run->startedAt + lastRuntime);
             });
         }
-        j.set("latestNum", int(buildNums[client->scope.job]));
+        j.set("latestNum", int(buildNums[scope.job]));
         j.startArray("artifacts");
-        populateArtifacts(j, client->scope.job, client->scope.num);
+        populateArtifacts(j, scope.job, scope.num);
         j.EndArray();
-    } else if(client->scope.type == MonitorScope::JOB) {
+    } else if(scope.type == MonitorScope::JOB) {
         const uint runsPerPage = 10;
         j.startArray("recent");
         // ORDER BY param cannot be bound
         std::string order_by;
-        std::string direction = client->scope.order_desc ? "DESC" : "ASC";
-        if(client->scope.field == "number")
+        std::string direction = scope.order_desc ? "DESC" : "ASC";
+        if(scope.field == "number")
             order_by = "number " + direction;
-        else if(client->scope.field == "result")
+        else if(scope.field == "result")
             order_by = "result " + direction + ", number DESC";
-        else if(client->scope.field == "started")
+        else if(scope.field == "started")
             order_by = "startedAt " + direction + ", number DESC";
-        else if(client->scope.field == "duration")
+        else if(scope.field == "duration")
             order_by = "(completedAt-startedAt) " + direction + ", number DESC";
         else
             order_by = "number DESC";
         std::string stmt = "SELECT number,startedAt,completedAt,result,reason FROM builds WHERE name = ? ORDER BY "
                 + order_by + " LIMIT ?,?";
         db->stmt(stmt.c_str())
-        .bind(client->scope.job, client->scope.page * runsPerPage, runsPerPage)
+        .bind(scope.job, scope.page * runsPerPage, runsPerPage)
         .fetch<uint,time_t,time_t,int,str>([&](uint build,time_t started,time_t completed,int result,str reason){
             j.StartObject();
             j.set("number", build)
@@ -305,23 +273,23 @@ void Laminar::sendStatus(LaminarClient* client) {
         });
         j.EndArray();
         db->stmt("SELECT COUNT(*),AVG(completedAt-startedAt) FROM builds WHERE name = ?")
-        .bind(client->scope.job)
+        .bind(scope.job)
         .fetch<uint,uint>([&](uint nRuns, uint averageRuntime){
             j.set("averageRuntime", averageRuntime);
             j.set("pages", (nRuns-1) / runsPerPage + 1);
             j.startObject("sort");
-            j.set("page", client->scope.page)
-             .set("field", client->scope.field)
-             .set("order", client->scope.order_desc ? "dsc" : "asc")
+            j.set("page", scope.page)
+             .set("field", scope.field)
+             .set("order", scope.order_desc ? "dsc" : "asc")
              .EndObject();
         });
         j.startArray("running");
-        auto p = activeJobs.byJobName().equal_range(client->scope.job);
+        auto p = activeJobs.byJobName().equal_range(scope.job);
         for(auto it = p.first; it != p.second; ++it) {
             const std::shared_ptr<Run> run = *it;
             j.StartObject();
             j.set("number", run->build);
-            j.set("node", run->node->name);
+            j.set("context", run->context->name);
             j.set("started", run->startedAt);
             j.set("result", to_string(RunState::RUNNING));
             j.set("reason", run->reason());
@@ -330,27 +298,28 @@ void Laminar::sendStatus(LaminarClient* client) {
         j.EndArray();
         int nQueued = 0;
         for(const auto& run : queuedJobs) {
-            if (run->name == client->scope.job) {
+            if (run->name == scope.job) {
                 nQueued++;
             }
         }
         j.set("nQueued", nQueued);
         db->stmt("SELECT number,startedAt FROM builds WHERE name = ? AND result = ? ORDER BY completedAt DESC LIMIT 1")
-        .bind(client->scope.job, int(RunState::SUCCESS))
+        .bind(scope.job, int(RunState::SUCCESS))
         .fetch<int,time_t>([&](int build, time_t started){
             j.startObject("lastSuccess");
             j.set("number", build).set("started", started);
             j.EndObject();
         });
         db->stmt("SELECT number,startedAt FROM builds WHERE name = ? AND result <> ? ORDER BY completedAt DESC LIMIT 1")
-        .bind(client->scope.job, int(RunState::SUCCESS))
+        .bind(scope.job, int(RunState::SUCCESS))
         .fetch<int,time_t>([&](int build, time_t started){
             j.startObject("lastFailed");
             j.set("number", build).set("started", started);
             j.EndObject();
         });
-
-    } else if(client->scope.type == MonitorScope::ALL) {
+        auto desc = jobDescriptions.find(scope.job);
+        j.set("description", desc == jobDescriptions.end() ? "" : desc->second);
+    } else if(scope.type == MonitorScope::ALL) {
         j.startArray("jobs");
         db->stmt("SELECT name,number,startedAt,completedAt,result FROM builds b JOIN (SELECT name n,MAX(number) l FROM builds GROUP BY n) q ON b.name = q.n AND b.number = q.l")
         .fetch<str,uint,time_t,time_t,int>([&](str name,uint number, time_t started, time_t completed, int result){
@@ -360,11 +329,6 @@ void Laminar::sendStatus(LaminarClient* client) {
             j.set("result", to_string(RunState(result)));
             j.set("started", started);
             j.set("completed", completed);
-            j.startArray("tags");
-            for(const str& t: jobTags[name]) {
-                j.String(t.c_str());
-            }
-            j.EndArray();
             j.EndObject();
         });
         j.EndArray();
@@ -373,24 +337,23 @@ void Laminar::sendStatus(LaminarClient* client) {
             j.StartObject();
             j.set("name", run->name);
             j.set("number", run->build);
-            j.set("node", run->node->name);
+            j.set("context", run->context->name);
             j.set("started", run->startedAt);
-            j.startArray("tags");
-            for(const str& t: jobTags[run->name]) {
-                j.String(t.c_str());
-            }
-            j.EndArray();
             j.EndObject();
         }
         j.EndArray();
+        j.startObject("groups");
+        for(const auto& group : jobGroups)
+            j.set(group.first.c_str(), group.second);
+        j.EndObject();
     } else { // Home page
         j.startArray("recent");
         db->stmt("SELECT * FROM builds ORDER BY completedAt DESC LIMIT 15")
-        .fetch<str,uint,str,time_t,time_t,time_t,int>([&](str name,uint build,str node,time_t,time_t started,time_t completed,int result){
+        .fetch<str,uint,str,time_t,time_t,time_t,int>([&](str name,uint build,str context,time_t,time_t started,time_t completed,int result){
             j.StartObject();
             j.set("name", name)
              .set("number", build)
-             .set("node", node)
+             .set("context", context)
              .set("started", started)
              .set("completed", completed)
              .set("result", to_string(RunState(result)))
@@ -402,7 +365,7 @@ void Laminar::sendStatus(LaminarClient* client) {
             j.StartObject();
             j.set("name", run->name);
             j.set("number", run->build);
-            j.set("node", run->node->name);
+            j.set("context", run->context->name);
             j.set("started", run->startedAt);
             db->stmt("SELECT completedAt - startedAt FROM builds WHERE name = ? ORDER BY completedAt DESC LIMIT 1")
              .bind(run->name)
@@ -421,10 +384,10 @@ void Laminar::sendStatus(LaminarClient* client) {
         j.EndArray();
         int execTotal = 0;
         int execBusy = 0;
-        for(const auto& it : nodes) {
-            const std::shared_ptr<Node>& node = it.second;
-            execTotal += node->numExecutors;
-            execBusy += node->busyExecutors;
+        for(const auto& it : contexts) {
+            const std::shared_ptr<Context>& context = it.second;
+            execTotal += context->numExecutors;
+            execBusy += context->busyExecutors;
         }
         j.set("executorsTotal", execTotal);
         j.set("executorsBusy", execBusy);
@@ -512,80 +475,55 @@ void Laminar::sendStatus(LaminarClient* client) {
 
     }
     j.EndObject();
-    client->sendMessage(j.str());
+    return j.str();
 }
 
 Laminar::~Laminar() noexcept try {
     delete db;
-    delete srv;
 } catch (std::exception& e) {
     LLOG(ERROR, e.what());
     return;
-}
-
-void Laminar::run() {
-    const char* listen_rpc = getenv("LAMINAR_BIND_RPC") ?: INTADDR_RPC_DEFAULT;
-    const char* listen_http = getenv("LAMINAR_BIND_HTTP") ?: INTADDR_HTTP_DEFAULT;
-
-    srv = new Server(*this, listen_rpc, listen_http);
-    srv->addWatchPath((homePath/"cfg"/"nodes").toString(true).cStr());
-    srv->addWatchPath((homePath/"cfg"/"jobs").toString(true).cStr());
-    srv->start();
-}
-
-void Laminar::stop() {
-    srv->stop();
 }
 
 bool Laminar::loadConfiguration() {
     if(const char* ndirs = getenv("LAMINAR_KEEP_RUNDIRS"))
         numKeepRunDirs = static_cast<uint>(atoi(ndirs));
 
-    std::set<std::string> knownNodes;
+    std::set<std::string> knownContexts;
 
-    KJ_IF_MAYBE(nodeDir, fsHome->tryOpenSubdir(kj::Path{"cfg","nodes"})) {
-        for(kj::Directory::Entry& entry : (*nodeDir)->listEntries()) {
+    KJ_IF_MAYBE(contextsDir, fsHome->tryOpenSubdir(kj::Path{"cfg","contexts"})) {
+        for(kj::Directory::Entry& entry : (*contextsDir)->listEntries()) {
             if(!entry.name.endsWith(".conf"))
                 continue;
 
-            StringMap conf = parseConfFile((homePath/"cfg"/"nodes"/entry.name).toString(true).cStr());
+            StringMap conf = parseConfFile((homePath/"cfg"/"contexts"/entry.name).toString(true).cStr());
 
-            std::string nodeName(entry.name.cStr(), entry.name.findLast('.').orDefault(0));
-            auto existingNode = nodes.find(nodeName);
-            std::shared_ptr<Node> node = existingNode == nodes.end() ? nodes.emplace(nodeName, std::shared_ptr<Node>(new Node)).first->second : existingNode->second;
-            node->name = nodeName;
-            node->numExecutors = conf.get<int>("EXECUTORS", 6);
+            std::string name(entry.name.cStr(), entry.name.findLast('.').orDefault(0));
+            auto existing = contexts.find(name);
+            std::shared_ptr<Context> context = existing == contexts.end() ? contexts.emplace(name, std::shared_ptr<Context>(new Context)).first->second : existing->second;
+            context->name = name;
+            context->numExecutors = conf.get<int>("EXECUTORS", 6);
 
-            std::string tagString = conf.get<std::string>("TAGS");
-            std::set<std::string> tagList;
-            if(!tagString.empty()) {
-                std::istringstream iss(tagString);
-                std::string tag;
-                while(std::getline(iss, tag, ','))
-                    tagList.insert(tag);
-            }
-            std::swap(node->tags, tagList);
-
-            knownNodes.insert(nodeName);
+            knownContexts.insert(name);
         }
     }
 
-    // remove any nodes whose config files disappeared.
-    // if there are no known nodes, take care not to remove and re-add the default node
-    for(auto it = nodes.begin(); it != nodes.end();) {
-        if((it->first == "" && knownNodes.size() == 0) || knownNodes.find(it->first) != knownNodes.end())
+    // remove any contexts whose config files disappeared.
+    // if there are no known contexts, take care not to remove and re-add the default context.
+    for(auto it = contexts.begin(); it != contexts.end();) {
+        if((it->first == "default" && knownContexts.size() == 0) || knownContexts.find(it->first) != knownContexts.end())
             it++;
         else
-            it = nodes.erase(it);
+            it = contexts.erase(it);
     }
 
-    // add a default node
-    if(nodes.empty()) {
-        LLOG(INFO, "Creating a default node with 6 executors");
-        std::shared_ptr<Node> node(new Node);
-        node->name = "";
-        node->numExecutors = 6;
-        nodes.emplace("", node);
+    // add a default context
+    if(contexts.empty()) {
+        LLOG(INFO, "Creating a default context with 6 executors");
+        std::shared_ptr<Context> context(new Context);
+        context->name = "default";
+        context->numExecutors = 6;
+        contexts.emplace("default", context);
     }
 
     KJ_IF_MAYBE(jobsDir, fsHome->tryOpenSubdir(kj::Path{"cfg","jobs"})) {
@@ -596,18 +534,28 @@ bool Laminar::loadConfiguration() {
 
             std::string jobName(entry.name.cStr(), entry.name.findLast('.').orDefault(0));
 
-            std::string tags = conf.get<std::string>("TAGS");
-            if(!tags.empty()) {
-                std::istringstream iss(tags);
-                std::set<std::string> tagList;
-                std::string tag;
-                while(std::getline(iss, tag, ','))
-                    tagList.insert(tag);
-                jobTags[jobName] = tagList;
-            }
+            std::string ctxPtns = conf.get<std::string>("CONTEXTS");
 
+            if(!ctxPtns.empty()) {
+                std::istringstream iss(ctxPtns);
+                std::set<std::string> ctxPtnList;
+                std::string ctx;
+                while(std::getline(iss, ctx, ','))
+                    ctxPtnList.insert(ctx);
+                jobContexts[jobName].swap(ctxPtnList);
+            }
+            std::string desc = conf.get<std::string>("DESCRIPTION");
+            if(!desc.empty()) {
+                jobDescriptions[jobName] = desc;
+            }
         }
     }
+
+    jobGroups.clear();
+    KJ_IF_MAYBE(groupsConf, fsHome->tryOpenFile(kj::Path{"cfg","groups.conf"}))
+        jobGroups = parseConfFile((homePath/"cfg"/"groups.conf").toString(true).cStr());
+    if(jobGroups.empty())
+        jobGroups["All Jobs"] = ".*";
 
     return true;
 }
@@ -618,6 +566,10 @@ std::shared_ptr<Run> Laminar::queueJob(std::string name, ParamMap params) {
         return nullptr;
     }
 
+    // If the job has no contexts (maybe there is no .conf file at all), add the default context
+    if(jobContexts[name].empty())
+        jobContexts.at(name).insert("default");
+
     std::shared_ptr<Run> run = std::make_shared<Run>(name, kj::mv(params), homePath.clone());
     queuedJobs.push_back(run);
 
@@ -627,67 +579,32 @@ std::shared_ptr<Run> Laminar::queueJob(std::string name, ParamMap params) {
         .startObject("data")
         .set("name", name)
         .EndObject();
-    const char* msg = j.str();
-    for(LaminarClient* c : clients) {
-        if(c->scope.wantsStatus(name))
-            c->sendMessage(msg);
-    }
+    http->notifyEvent(j.str(), name.c_str());
 
     assignNewJobs();
     return run;
 }
 
-void Laminar::notifyConfigChanged()
-{
-    LLOG(INFO, "Reloading configuration");
-    loadConfiguration();
-    // config change may allow stuck jobs to dequeue
-    assignNewJobs();
-}
-
 bool Laminar::abort(std::string job, uint buildNum) {
-    if(Run* run = activeRun(job, buildNum)) {
-        run->abort(true);
-        return true;
-    }
+    if(Run* run = activeRun(job, buildNum))
+        return run->abort();
     return false;
 }
 
 void Laminar::abortAll() {
     for(std::shared_ptr<Run> run : activeJobs) {
-        run->abort(false);
+        run->abort();
     }
-}
-
-bool Laminar::nodeCanQueue(const Node& node, std::string jobName) const {
-    // if a node is too busy, it can't take the job
-    if(node.busyExecutors >= node.numExecutors)
-        return false;
-
-    // if the node has no tags, allow the build
-    if(node.tags.size() == 0)
-        return true;
-
-    auto it = jobTags.find(jobName);
-    // if the job has no tags, it cannot be run on this node
-    if(it == jobTags.end())
-        return false;
-
-    // otherwise, allow the build if job and node have a tag in common
-    for(const std::string& tag : it->second) {
-        if(node.tags.find(tag) != node.tags.end())
-            return true;
-    }
-
-    return false;
 }
 
 bool Laminar::tryStartRun(std::shared_ptr<Run> run, int queueIndex) {
-    for(auto& sn : nodes) {
-        std::shared_ptr<Node> node = sn.second;
+    for(auto& sc : contexts) {
+        std::shared_ptr<Context> ctx = sc.second;
 
-        if(nodeCanQueue(*node.get(), run->name) && run->configure(buildNums[run->name] + 1, node, *fsHome)) {
-            node->busyExecutors++;
+        if(ctx->canQueue(jobContexts.at(run->name))) {
+            kj::Promise<RunState> onRunFinished = run->start(buildNums[run->name] + 1, ctx, *fsHome,[this](kj::Maybe<pid_t>& pid){return srv.onChildExit(pid);});
+
+            ctx->busyExecutors++;
             // set the last known result if exists
             db->stmt("SELECT result FROM builds WHERE name = ? ORDER BY completedAt DESC LIMIT 1")
              .bind(run->name)
@@ -695,17 +612,24 @@ bool Laminar::tryStartRun(std::shared_ptr<Run> run, int queueIndex) {
                 run->lastResult = RunState(result);
             });
 
-            // Actually schedules the Run steps
-            kj::Promise<void> exec = handleRunStep(run.get()).then([=]{
-                runFinished(run.get());
+            kj::Promise<void> exec = srv.readDescriptor(run->output_fd, [this, run](const char*b, size_t n){
+                // handle log output
+                std::string s(b, n);
+                run->log += s;
+                http->notifyLog(run->name, run->build, s, false);
+            }).then([run, p = kj::mv(onRunFinished)]() mutable {
+                // wait until leader reaped
+                return kj::mv(p);
+            }).then([this, run](RunState){
+                handleRunFinished(run.get());
             });
             if(run->timeout > 0) {
-                exec = exec.attach(srv->addTimeout(run->timeout, [r=run.get()](){
-                    r->abort(true);
+                exec = exec.attach(srv.addTimeout(run->timeout, [r=run.get()](){
+                    r->abort();
                 }));
             }
-            srv->addTask(kj::mv(exec));
-            LLOG(INFO, "Started job on node", run->name, run->build, node->name);
+            srv.addTask(kj::mv(exec));
+            LLOG(INFO, "Started job", run->name, run->build, ctx->name);
 
             // update next build number
             buildNums[run->name]++;
@@ -725,22 +649,8 @@ bool Laminar::tryStartRun(std::shared_ptr<Run> run, int queueIndex) {
              .fetch<uint>([&](uint etc){
                 j.set("etc", time(nullptr) + etc);
             });
-            j.startArray("tags");
-            for(const str& t: jobTags[run->name]) {
-                j.String(t.c_str());
-            }
-            j.EndArray();
             j.EndObject();
-            const char* msg = j.str();
-            for(LaminarClient* c : clients) {
-                if(c->scope.wantsStatus(run->name, run->build)
-                    // The run page also should know that another job has started
-                    // (so maybe it can show a previously hidden "next" button).
-                    // Hence this small hack:
-                        || (c->scope.type == MonitorScope::Type::RUN && c->scope.job == run->name))
-                    c->sendMessage(msg);
-            }
-
+            http->notifyEvent(j.str(), run->name.c_str());
             return true;
         }
     }
@@ -759,37 +669,10 @@ void Laminar::assignNewJobs() {
     }
 }
 
-kj::Promise<void> Laminar::handleRunStep(Run* run) {
-    if(run->step()) {
-        // no more steps
-        return kj::READY_NOW;
-    }
+void Laminar::handleRunFinished(Run * r) {
+    std::shared_ptr<Context> ctx = r->context;
 
-    kj::Promise<int> exited = srv->onChildExit(run->current_pid);
-    // promise is fulfilled when the process is reaped. But first we wait for all
-    // output from the pipe (Run::output_fd) to be consumed.
-    return srv->readDescriptor(run->output_fd, [this,run](const char*b,size_t n){
-        // handle log output
-        std::string s(b, n);
-        run->log += s;
-        for(LaminarClient* c : clients) {
-            if(c->scope.wantsLog(run->name, run->build))
-                c->sendMessage(s);
-        }
-    }).then([p = std::move(exited)]() mutable {
-        // wait until the process is reaped
-        return kj::mv(p);
-    }).then([this, run](int status){
-        run->reaped(status);
-        // next step in Run
-        return handleRunStep(run);
-    });
-}
-
-void Laminar::runFinished(Run * r) {
-    std::shared_ptr<Node> node = r->node;
-
-    node->busyExecutors--;
+    ctx->busyExecutors--;
     LLOG(INFO, "Run completed", r->name, to_string(r->result));
     time_t completedAt = time(nullptr);
 
@@ -808,7 +691,7 @@ void Laminar::runFinished(Run * r) {
 
     std::string reason = r->reason();
     db->stmt("INSERT INTO builds VALUES(?,?,?,?,?,?,?,?,?,?,?,?)")
-     .bind(r->name, r->build, node->name, r->queuedAt, r->startedAt, completedAt, int(r->result),
+     .bind(r->name, r->build, ctx->name, r->queuedAt, r->startedAt, completedAt, int(r->result),
            maybeZipped, logsize, r->parentName, r->parentBuild, reason)
      .exec();
 
@@ -823,27 +706,12 @@ void Laminar::runFinished(Run * r) {
             .set("started", r->startedAt)
             .set("result", to_string(r->result))
             .set("reason", r->reason());
-    j.startArray("tags");
-    for(const str& t: jobTags[r->name]) {
-        j.String(t.c_str());
-    }
-    j.EndArray();
     j.startArray("artifacts");
     populateArtifacts(j, r->name, r->build);
     j.EndArray();
     j.EndObject();
-    const char* msg = j.str();
-    for(LaminarClient* c : clients) {
-        if(c->scope.wantsStatus(r->name, r->build))
-            c->sendMessage(msg);
-        c->notifyJobFinished();
-    }
-
-    // notify the waiters
-    for(LaminarWaiter* w : waiters) {
-        w->complete(r);
-    }
-
+    http->notifyEvent(j.str(), r->name);
+    http->notifyLog(r->name, r->build, "", true);
     // erase reference to run from activeJobs. Since runFinished is called in a
     // lambda whose context contains a shared_ptr<Run>, the run won't be deleted
     // until the context is destroyed at the end of the lambda execution.
@@ -884,7 +752,7 @@ bool Laminar::handleBadgeRequest(std::string job, std::string &badge) {
     db->stmt("SELECT result FROM builds WHERE name = ? ORDER BY number DESC LIMIT 1")
             .bind(job)
             .fetch<int>([&](int result){
-        rs = (RunState) result;
+        rs = RunState(result);
     });
     if(rs == RunState::UNKNOWN)
         return false;

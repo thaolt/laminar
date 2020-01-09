@@ -22,30 +22,30 @@ const timeScale = function(max){
   ? { scale:function(v){return Math.round(v/60)/10}, label:'Minutes' }
   : { scale:function(v){return v;}, label:'Seconds' };
 }
-
-const WebsocketHandler = function() {
-  function setupWebsocket(path, next) {
-    let ws = new WebSocket(document.head.baseURI.replace(/^http/,'ws') + path.substr(1));
-    ws.onmessage = function(msg) {
+const ServerEventHandler = function() {
+  function setupEventSource(path, query, next) {
+    const es = new EventSource(document.head.baseURI + path.substr(1) + query);
+    es.path = path; // save for later in case we need to add query params
+    es.onmessage = function(msg) {
       msg = JSON.parse(msg.data);
-      // "status" is the first message the websocket always delivers.
+      // "status" is the first message the server always delivers.
       // Use this to confirm the navigation. The component is not
       // created until next() is called, so creating a reference
       // for other message types must be deferred. There are some extra
-      // subtle checks here. If this websocket already has a component,
+      // subtle checks here. If this eventsource already has a component,
       // then this is not the first time the status message has been
       // received. If the frontend requests an update, the status message
       // should not be handled here, but treated the same as any other
       // message. An exception is if the connection has been lost - in
       // that case we should treat this as a "first-time" status message.
-      // this.comp.ws is used as a proxy for this.
-      if (msg.type === 'status' && (!this.comp || !this.comp.ws)) {
+      // this.comp.es is used as a proxy for this.
+      if (msg.type === 'status' && (!this.comp || !this.comp.es)) {
         next(comp => {
           // Set up bidirectional reference
           // 1. needed to reference the component for other msg types
           this.comp = comp;
           // 2. needed to close the ws on navigation away
-          comp.ws = this;
+          comp.es = this;
           // Update html and nav titles
           document.title = comp.$root.title = msg.title;
           // Calculate clock offset (used by ProgressUpdater)
@@ -59,47 +59,35 @@ const WebsocketHandler = function() {
         if (!this.comp)
           return console.error("Page component was undefined");
         else {
+          this.comp.$root.connected = true;
           this.comp.$root.showNotify(msg.type, msg.data);
           if(typeof this.comp[msg.type] === 'function')
             this.comp[msg.type](msg.data);
         }
       }
-    };
-    ws.onclose = function(ev) {
-      // if this.comp isn't set, this connection has never been used
-      // and a re-connection isn't meaningful
-      if(!ev.wasClean && 'comp' in this) {
-        this.comp.$root.connected = false;
-        // remove the reference to the websocket from the component.
-        // This not only cleans up an unneeded reference but ensures a
-        // status message on reconnection is treated as "first-time"
-        delete this.comp.ws;
-        this.reconnectTimeout = setTimeout(()=>{
-          var newWs = setupWebsocket(path, (fn) => { fn(this.comp); });
-          // the next() callback won't happen if the server is still
-          // unreachable. Save the reference to the last component
-          // here so we can recover if/when it does return. This means
-          // passing this.comp in the next() callback above is redundant
-          // but necessary to keep the same implementation.
-          newWs.comp = this.comp;
-        }, 2000);
-      }
     }
-    return ws;
-  };
+    es.onerror = function() {
+      this.comp.$root.connected = false;
+    }
+    return es;
+  }
   return {
     beforeRouteEnter(to, from, next) {
-      setupWebsocket(to.path, (fn) => { next(fn); });
+      setupEventSource(to.path, '', (fn) => { next(fn); });
     },
     beforeRouteUpdate(to, from, next) {
-      this.ws.close();
-      clearTimeout(this.ws.reconnectTimeout);
-      setupWebsocket(to.path, (fn) => { fn(this); next(); });
+      this.es.close();
+      setupEventSource(to.path, '', (fn) => { fn(this); next(); });
     },
     beforeRouteLeave(to, from, next) {
-      this.ws.close();
-      clearTimeout(this.ws.reconnectTimeout);
+      this.es.close();
       next();
+    },
+    methods: {
+      query(q) {
+        this.es.close();
+        setupEventSource(this.es.path, '?' + Object.entries(q).map(([k,v])=>`${k}=${v}`).join('&'), (fn) => { fn(this); });
+      }
     }
   };
 }();
@@ -195,7 +183,7 @@ const Home = function() {
 
   return {
     template: '#home',
-    mixins: [WebsocketHandler, Utils, ProgressUpdater],
+    mixins: [ServerEventHandler, Utils, ProgressUpdater],
     data: function() {
       return state;
     },
@@ -427,12 +415,13 @@ const Jobs = function() {
   var state = {
     jobs: [],
     search: '',
-    tags: [],
-    tag: null
+    groups: {},
+    group: null,
+    ungrouped: []
   };
   return {
     template: '#jobs',
-    mixins: [WebsocketHandler, Utils, ProgressUpdater],
+    mixins: [ServerEventHandler, Utils, ProgressUpdater],
     data: function() { return state; },
     methods: {
       status: function(msg) {
@@ -449,13 +438,10 @@ const Jobs = function() {
             state.jobs.sort(function(a, b){return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;});
           }
         }
-        var tags = {};
-        for (var i in state.jobs) {
-          for (var j in state.jobs[i].tags) {
-            tags[state.jobs[i].tags[j]] = true;
-          }
-        }
-        state.tags = Object.keys(tags);
+        state.groups = {};
+        Object.keys(msg.groups).map(k => state.groups[k] = new RegExp(msg.groups[k]));
+        state.ungrouped = state.jobs.filter(j => !Object.values(state.groups).some(r => r.test(j.name))).map(j => j.name);
+        state.group = state.ungrouped.length ? null : Object.keys(state.groups)[0];
       },
       job_started: function(data) {
         var updAt = null;
@@ -482,6 +468,8 @@ const Jobs = function() {
           // first execution of new job. TODO insert without resort
           state.jobs.unshift(data);
           state.jobs.sort(function(a, b){return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;});
+          if(!Object.values(state.groups).some(r => r.test(data.name)))
+              state.ungrouped.push(data.name);
         } else {
           state.jobs[updAt] = data;
         }
@@ -504,19 +492,13 @@ const Jobs = function() {
         }
       },
       filteredJobs: function() {
-        var ret = state.jobs;
-        var tag = state.tag;
-        if (tag) {
-          ret = ret.filter(function(job) {
-            return job.tags.indexOf(tag) >= 0;
-          });
-        }
-        var search = this.search;
-        if (search) {
-          ret = ret.filter(function(job) {
-            return job.name.indexOf(search) > -1;
-          });
-        }
+        let ret = [];
+        if (state.group)
+          ret = state.jobs.filter(job => state.groups[state.group].test(job.name));
+        else
+          ret = state.jobs.filter(job => state.ungrouped.includes(job.name));
+        if (this.search)
+          ret = ret.filter(job => job.name.indexOf(this.search) > -1);
         return ret;
       },
     }
@@ -525,6 +507,7 @@ const Jobs = function() {
 
 var Job = function() {
   var state = {
+    description: '',
     jobsRunning: [],
     jobsRecent: [],
     lastSuccess: null,
@@ -536,12 +519,13 @@ var Job = function() {
   var chtBt = null;
   return Vue.extend({
     template: '#job',
-    mixins: [WebsocketHandler, Utils, ProgressUpdater],
+    mixins: [ServerEventHandler, Utils, ProgressUpdater],
     data: function() {
       return state;
     },
     methods: {
       status: function(msg) {
+        state.description = msg.description;
         state.jobsRunning = msg.running;
         state.jobsRecent = msg.recent;
         state.lastSuccess = msg.lastSuccess;
@@ -634,11 +618,11 @@ var Job = function() {
       },
       page_next: function() {
         state.sort.page++;
-        this.ws.send(JSON.stringify(state.sort));
+        this.query(state.sort)
       },
       page_prev: function() {
         state.sort.page--;
-        this.ws.send(JSON.stringify(state.sort));
+        this.query(state.sort)
       },
       do_sort: function(field) {
         if(state.sort.field == field) {
@@ -647,7 +631,7 @@ var Job = function() {
           state.sort.order = 'dsc';
           state.sort.field = field;
         }
-        this.ws.send(JSON.stringify(state.sort));
+        this.query(state.sort)
       }
     }
   });
@@ -690,7 +674,7 @@ const Run = function() {
 
   return {
     template: '#run',
-    mixins: [WebsocketHandler, Utils, ProgressUpdater],
+    mixins: [ServerEventHandler, Utils, ProgressUpdater],
     data: function() {
       return state;
     },

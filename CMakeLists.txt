@@ -85,9 +85,22 @@ generate_compressed_bins(${CMAKE_BINARY_DIR} js/vue-router.min.js js/vue.min.js
     js/ansi_up.js js/Chart.min.js css/bootstrap.min.css)
 # (see resources.cpp where these are fetched)
 
+set(LAMINARD_CORE_SOURCES
+    src/conf.cpp
+    src/database.cpp
+    src/laminar.cpp
+    src/leader.cpp
+    src/http.cpp
+    src/resources.cpp
+    src/rpc.cpp
+    src/run.cpp
+    src/server.cpp
+    laminar.capnp.c++
+    index_html_size.h
+)
+
 ## Server
-add_executable(laminard src/database.cpp src/main.cpp src/server.cpp src/laminar.cpp
-    src/conf.cpp src/resources.cpp src/run.cpp laminar.capnp.c++ ${COMPRESSED_BINS} index_html_size.h)
+add_executable(laminard ${LAMINARD_CORE_SOURCES} src/main.cpp ${COMPRESSED_BINS})
 target_link_libraries(laminard capnp-rpc capnp kj-http kj-async kj pthread sqlite3 z)
 
 ## Client
@@ -99,14 +112,15 @@ set(BUILD_TESTS FALSE CACHE BOOL "Build tests")
 if(BUILD_TESTS)
     find_package(GTest REQUIRED)
     include_directories(${GTEST_INCLUDE_DIRS} src)
-    add_executable(laminar-tests src/conf.cpp src/database.cpp src/laminar.cpp src/run.cpp src/server.cpp laminar.capnp.c++ src/resources.cpp ${COMPRESSED_BINS} test/test-conf.cpp test/test-database.cpp test/test-laminar.cpp test/test-run.cpp test/test-server.cpp)
-    target_link_libraries(laminar-tests ${GTEST_BOTH_LIBRARIES} gmock capnp-rpc capnp kj-http kj-async kj pthread sqlite3 z)
+    add_executable(laminar-tests ${LAMINARD_CORE_SOURCES} ${COMPRESSED_BINS} test/main.cpp test/laminar-functional.cpp test/unit-conf.cpp test/unit-database.cpp)
+    target_link_libraries(laminar-tests ${GTEST_LIBRARY} capnp-rpc capnp kj-http kj-async kj pthread sqlite3 z)
 endif()
 
 set(SYSTEMD_UNITDIR lib/systemd/system CACHE PATH "Path to systemd unit files")
 set(BASH_COMPLETIONS_DIR usr/share/bash-completion/completions CACHE PATH "Path to bash completions directory")
 set(ZSH_COMPLETIONS_DIR usr/share/zsh/site-functions CACHE PATH "Path to zsh completions directory")
-install(TARGETS laminard laminarc RUNTIME DESTINATION usr/bin)
+install(TARGETS laminard RUNTIME DESTINATION usr/sbin)
+install(TARGETS laminarc RUNTIME DESTINATION usr/bin)
 install(FILES etc/laminar.service DESTINATION ${SYSTEMD_UNITDIR})
 install(FILES etc/laminar.conf DESTINATION etc)
 install(FILES etc/laminarc-completion.bash DESTINATION ${BASH_COMPLETIONS_DIR} RENAME laminarc)
