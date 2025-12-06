@@ -1,5 +1,5 @@
 ///
-/// Copyright 2015-2019 Oliver Giles
+/// Copyright 2015-2020 Oliver Giles
 ///
 /// This file is part of Laminar
 ///
@@ -19,7 +19,6 @@
 #ifndef LAMINAR_CONTEXT_H_
 #define LAMINAR_CONTEXT_H_
 
-#include <fnmatch.h>
 #include <string>
 #include <set>
 class Run;
@@ -34,17 +33,7 @@ public:
     std::string name;
     int numExecutors;
     int busyExecutors = 0;
-
-    bool canQueue(std::set<std::string>& patterns) {
-        if(busyExecutors >= numExecutors)
-            return false;
-
-        for(std::string pattern : patterns) {
-            if(fnmatch(pattern.c_str(), name.c_str(), FNM_EXTMATCH) == 0)
-                return true;
-        }
-        return false;
-    }
+    std::set<std::string> jobPatterns;
 };
 
 

@@ -1,5 +1,5 @@
 ///
-/// Copyright 2018 Oliver Giles
+/// Copyright 2018-2022 Oliver Giles
 ///
 /// This file is part of Laminar
 ///
@@ -19,6 +19,8 @@
 #ifndef LAMINAR_TEMPDIR_H_
 #define LAMINAR_TEMPDIR_H_
 
+#include "log.h"
+
 #include <kj/filesystem.h>
 #include <stdlib.h>
 
@@ -26,18 +28,31 @@ class TempDir {
 public:
     TempDir() :
         path(mkdtemp()),
-        fs(kj::newDiskFilesystem()->getRoot().openSubdir(path, kj::WriteMode::CREATE|kj::WriteMode::MODIFY))
+        fs(kj::newDiskFilesystem()->getRoot().openSubdir(path, kj::WriteMode::MODIFY))
     {
     }
     ~TempDir() noexcept {
         kj::newDiskFilesystem()->getRoot().remove(path);
     }
+    void init() {
+        // set up empty directory structure
+        fs->openSubdir(kj::Path{"cfg"}, kj::WriteMode::CREATE);
+        fs->openSubdir(kj::Path{"cfg", "jobs"}, kj::WriteMode::CREATE);
+        fs->openSubdir(kj::Path{"cfg", "contexts"}, kj::WriteMode::CREATE);
+    }
+    void clean() {
+        // rm -rf in config folder
+        for(kj::StringPtr name : fs->listNames()) {
+            fs->remove(kj::Path{name});
+        }
+    }
+
     kj::Path path;
     kj::Own<const kj::Directory> fs;
 private:
     static kj::Path mkdtemp() {
         char dir[] = "/tmp/laminar-test-XXXXXX";
-        ::mkdtemp(dir);
+        LASSERT(::mkdtemp(dir) != nullptr, "mkdtemp failed");
         return kj::Path::parse(&dir[1]);
     }
 };

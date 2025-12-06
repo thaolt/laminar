@@ -78,13 +78,13 @@ kj::Maybe<MonitorScope> fromUrl(std::string resource, char* query) {
         return kj::mv(scope);
     }
 
-    if(resource.substr(0, 5) != "/jobs")
-        return nullptr;
-
-    if(resource.length() == 5) {
+    if(resource == "/jobs" || resource == "/wallboard") {
         scope.type = MonitorScope::ALL;
         return kj::mv(scope);
     }
+
+    if(resource.substr(0, 5) != "/jobs")
+        return nullptr;
 
     resource = resource.substr(5);
     size_t split = resource.find('/',1);
@@ -131,9 +131,16 @@ kj::Promise<void> Http::cleanupPeers(kj::Timer& timer)
 {
     return timer.afterDelay(15 * kj::SECONDS).then([&]{
         for(EventPeer* p : eventPeers) {
-            // an empty SSE message is a colon followed by two newlines
-            p->pendingOutput.push_back(":\n\n");
-            p->fulfiller->fulfill();
+            // Even single threaded, if load causes this timeout to be serviced
+            // before writeEvents has created a fulfiller, or if an exception
+            // caused the destruction of the promise but attach(peer) hasn't yet
+            // removed it from the eventPeers list, we will see a null fulfiller
+            // here
+            if(p->fulfiller) {
+                // an empty SSE message is a colon followed by two newlines
+                p->pendingOutput.push_back(":\n\n");
+                p->fulfiller->fulfill();
+            }
         }
         return cleanupPeers(timer);
     }).eagerlyEvaluate(nullptr);
@@ -203,6 +210,8 @@ kj::Promise<void> Http::request(kj::HttpMethod method, kj::StringPtr url, const 
     if(is_sse) {
         KJ_IF_MAYBE(s, fromUrl(url.cStr(), queryString)) {
             responseHeaders.set(kj::HttpHeaderId::CONTENT_TYPE, "text/event-stream");
+            // Disables nginx reverse-proxy's buffering. Necessary for streamed events.
+            responseHeaders.add("X-Accel-Buffering", "no");
             auto peer = kj::heap<WithSetRef<EventPeer>>(eventPeers);
             peer->scope = *s;
             std::string st = "data: " + laminar.getStatus(peer->scope) + "\n\n";
@@ -219,9 +228,6 @@ kj::Promise<void> Http::request(kj::HttpMethod method, kj::StringPtr url, const 
             return stream->write(array.begin(), array.size()).attach(kj::mv(array)).attach(kj::mv(file)).attach(kj::mv(stream));
         }
     } else if(parseLogEndpoint(url, name, num)) {
-        auto lw = kj::heap<WithSetRef<LogWatcher>>(logWatchers);
-        lw->job = name;
-        lw->run = num;
         bool complete;
         std::string output;
         if(laminar.handleLogRequest(name, num, output, complete)) {
@@ -230,18 +236,17 @@ kj::Promise<void> Http::request(kj::HttpMethod method, kj::StringPtr url, const 
             // Disables nginx reverse-proxy's buffering. Necessary for dynamic log output.
             responseHeaders.add("X-Accel-Buffering", "no");
             auto stream = response.send(200, "OK", responseHeaders, nullptr);
-            return stream->write(output.data(), output.size()).then([=,s=stream.get(),c=lw.get()]{
+            auto s = stream.get();
+            auto lw = kj::heap<WithSetRef<LogWatcher>>(logWatchers);
+            lw->job = name;
+            lw->run = num;
+            auto promise = writeLogChunk(lw.get(), stream.get()).attach(kj::mv(stream)).attach(kj::mv(lw));
+            return s->write(output.data(), output.size()).attach(kj::mv(output)).then([p=kj::mv(promise),complete]() mutable {
                 if(complete)
                     return kj::Promise<void>(kj::READY_NOW);
-                return writeLogChunk(c, s);
-            }).attach(kj::mv(output)).attach(kj::mv(stream)).attach(kj::mv(lw));
+                return kj::mv(p);
+            });
         }
-    } else if(url == "/custom/style.css") {
-        responseHeaders.set(kj::HttpHeaderId::CONTENT_TYPE, "text/css; charset=utf-8");
-        responseHeaders.add("Content-Transfer-Encoding", "binary");
-        std::string css = laminar.getCustomCss();
-        auto stream = response.send(200, "OK", responseHeaders, css.size());
-        return stream->write(css.data(), css.size()).attach(kj::mv(css)).attach(kj::mv(stream));
     } else if(resources->handleRequest(url.cStr(), &start, &end, &content_type)) {
         responseHeaders.set(kj::HttpHeaderId::CONTENT_TYPE, content_type);
         responseHeaders.add("Content-Encoding", "gzip");
@@ -292,8 +297,13 @@ void Http::notifyLog(std::string job, uint run, std::string log_chunk, bool eot)
 {
     for(LogWatcher* lw : logWatchers) {
         if(lw->job == job && lw->run == run) {
-            lw->pendingOutput.push_back(kj::mv(log_chunk));
+            lw->pendingOutput.push_back(log_chunk);
             lw->fulfiller->fulfill(kj::mv(eot));
         }
     }
+}
+
+void Http::setHtmlTemplate(std::string tmpl)
+{
+    resources->setHtmlTemplate(tmpl);
 }

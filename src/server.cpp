@@ -1,5 +1,5 @@
 ///
-/// Copyright 2015-2019 Oliver Giles
+/// Copyright 2015-2021 Oliver Giles
 ///
 /// This file is part of Laminar
 ///
@@ -28,8 +28,8 @@
 
 #include <signal.h>
 #include <sys/eventfd.h>
+#include <sys/stat.h>
 #include <sys/inotify.h>
-#include <sys/signalfd.h>
 
 // Size of buffer used to read from file descriptors. Should be
 // a multiple of sizeof(struct signalfd_siginfo) == 128
@@ -95,7 +95,7 @@ kj::Promise<int> Server::onChildExit(kj::Maybe<pid_t> &pid) {
 
 Server::PathWatcher& Server::watchPaths(std::function<void()> fn)
 {
-    struct PathWatcherImpl : public PathWatcher {
+    struct PathWatcherImpl final : public PathWatcher {
         PathWatcher& addPath(const char* path) override {
             inotify_add_watch(fd, path, IN_ONLYDIR | IN_CLOSE_WRITE | IN_CREATE | IN_DELETE);
             return *this;
@@ -117,8 +117,11 @@ void Server::listenRpc(Rpc &rpc, kj::StringPtr rpcBindAddress)
     if(rpcBindAddress.startsWith("unix:"))
         unlink(rpcBindAddress.slice(strlen("unix:")).cStr());
     listeners->add(ioContext.provider->getNetwork().parseAddress(rpcBindAddress)
-              .then([this,&rpc](kj::Own<kj::NetworkAddress>&& addr) {
-        return acceptRpcClient(rpc, addr->listen());
+              .then([this,&rpc,rpcBindAddress](kj::Own<kj::NetworkAddress>&& addr) {
+        kj::Own<kj::ConnectionReceiver> listener = addr->listen();
+        if(rpcBindAddress.startsWith("unix:"))
+            chmod(rpcBindAddress.slice(strlen("unix:")).cStr(), 0660);
+        return acceptRpcClient(rpc, kj::mv(listener));
     }));
 
 }
@@ -128,8 +131,19 @@ void Server::listenHttp(Http &http, kj::StringPtr httpBindAddress)
     if(httpBindAddress.startsWith("unix:"))
         unlink(httpBindAddress.slice(strlen("unix:")).cStr());
     listeners->add(ioContext.provider->getNetwork().parseAddress(httpBindAddress)
-              .then([this,&http](kj::Own<kj::NetworkAddress>&& addr) {
-        return http.startServer(ioContext.lowLevelProvider->getTimer(), addr->listen());
+              .then([this,&http,httpBindAddress](kj::Own<kj::NetworkAddress>&& addr) {
+        kj::Own<kj::ConnectionReceiver> listener = addr->listen();
+        if(httpBindAddress.startsWith("unix:"))
+            chmod(httpBindAddress.slice(strlen("unix:")).cStr(), 0660);
+        return http.startServer(ioContext.lowLevelProvider->getTimer(), kj::mv(listener));
+    }).catch_([this,&http,httpBindAddress](kj::Exception&&e) mutable -> kj::Promise<void> {
+        if(e.getType() == kj::Exception::Type::DISCONNECTED) {
+            LLOG(ERROR, "HTTP disconnect, restarting server", e.getDescription());
+            listenHttp(http, httpBindAddress);
+            return kj::READY_NOW;
+        }
+        // otherwise propagate the exception
+        return kj::mv(e);
     }));
 }
 

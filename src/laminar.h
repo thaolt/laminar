@@ -1,5 +1,5 @@
 ///
-/// Copyright 2015-2019 Oliver Giles
+/// Copyright 2015-2022 Oliver Giles
 ///
 /// This file is part of Laminar
 ///
@@ -31,7 +31,7 @@
 // Context name to context object map
 typedef std::unordered_map<std::string, std::shared_ptr<Context>> ContextMap;
 
-struct Server;
+class Server;
 class Json;
 
 class Http;
@@ -52,7 +52,7 @@ public:
 
     // Queues a job, returns immediately. Return value will be nullptr if
     // the supplied name is not a known job.
-    std::shared_ptr<Run> queueJob(std::string name, ParamMap params = ParamMap());
+    std::shared_ptr<Run> queueJob(std::string name, ParamMap params = ParamMap(), bool frontOfQueue = false);
 
     // Return the latest known number of the named job
     uint latestRun(std::string job);
@@ -90,11 +90,6 @@ public:
     // if the job is unknown.
     bool handleBadgeRequest(std::string job, std::string& badge);
 
-    // Fetches the content of $LAMINAR_HOME/custom/style.css or an empty
-    // string. Ideally, this would instead be served by a proper web server
-    // which handles this url.
-    std::string getCustomCss();
-
     // Aborts a single job
     bool abort(std::string job, uint buildNum);
 
@@ -103,11 +98,13 @@ public:
 
 private:
     bool loadConfiguration();
+    void loadCustomizations();
     void assignNewJobs();
+    bool canQueue(const Context& ctx, const Run& run) const;
     bool tryStartRun(std::shared_ptr<Run> run, int queueIndex);
     void handleRunFinished(Run*);
     // expects that Json has started an array
-    void populateArtifacts(Json& out, std::string job, uint num) const;
+    void populateArtifacts(Json& out, std::string job, uint num, kj::Path subdir = kj::Path::parse(".")) const;
 
     Run* activeRun(const std::string name, uint num) {
         auto it = activeJobs.byNameNumber().find(boost::make_tuple(name, num));
@@ -124,7 +121,6 @@ private:
 
     std::unordered_map<std::string, std::string> jobGroups;
 
-    Settings settings;
     RunSet activeJobs;
     Database* db;
     Server& srv;

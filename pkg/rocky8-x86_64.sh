@@ -4,11 +4,11 @@ OUTPUT_DIR=$PWD
 
 SOURCE_DIR=$(readlink -f $(dirname ${BASH_SOURCE[0]})/..)
 
-VERSION=$(cd "$SOURCE_DIR" && git describe --tags --abbrev=8 --dirty | tr - .)~upstream_centos8
+VERSION=$(cd "$SOURCE_DIR" && git describe --tags --abbrev=8 --dirty | tr - .)~upstream_rocky8
 
 DOCKER_TAG=$(docker build -q - <<EOS
-FROM centos:8
-RUN dnf -y install rpm-build cmake make gcc-c++ wget sqlite-devel boost-devel zlib-devel
+FROM rockylinux/rockylinux:8
+RUN dnf -y update && dnf -y install rpm-build cmake make gcc-c++ wget sqlite-devel boost-devel zlib-devel
 EOS
 )
 
@@ -27,7 +27,7 @@ tar xzf capnproto.tar.gz
 tar xzf rapidjson.tar.gz
 
 cd /build/capnproto-0.7.0/c++/
-cmake3 -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=off .
+cmake -DCMAKE_BUILD_TYPE=Release -DBUILD_TESTING=off .
 make -j4
 make install
 
@@ -51,7 +51,7 @@ Lightweight Continuous Integration Service
 %prep
 
 %build
-cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/ -DSYSTEMD_UNITDIR=%{_unitdir} %{_sourcedir}/laminar-$VERSION
+cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr -DLAMINAR_VERSION=$VERSION -DSYSTEMD_UNITDIR=%{_unitdir} %{_sourcedir}/laminar-$VERSION
 pwd
 make
 
@@ -65,6 +65,8 @@ make
 %config(noreplace) %{_sysconfdir}/laminar.conf
 %{_datarootdir}/bash-completion/completions/laminarc
 %{_datarootdir}/zsh/site-functions/_laminarc
+%{_mandir}/man8/laminard.8.gz
+%{_mandir}/man1/laminarc.1.gz
 
 %post
 echo Creating laminar user with home in %{_sharedstatedir}/laminar

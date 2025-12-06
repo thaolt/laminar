@@ -1,5 +1,5 @@
 ///
-/// Copyright 2015-2018 Oliver Giles
+/// Copyright 2015-2020 Oliver Giles
 ///
 /// This file is part of Laminar
 ///
@@ -21,9 +21,15 @@
 #include "conf.h"
 #include "log.h"
 
+#include <sys/wait.h>
 #include <iostream>
 #include <unistd.h>
 #include <signal.h>
+
+#if defined(__FreeBSD__)
+#include <sys/sysctl.h>
+#include <sys/limits.h>
+#endif
 
 // short syntax helper for kj::Path
 template<typename T>
@@ -33,7 +39,7 @@ inline kj::Path operator/(const kj::Path& p, const T& ext) {
 
 std::string to_string(const RunState& rs) {
     switch(rs) {
-    case RunState::PENDING: return "pending";
+    case RunState::QUEUED: return "queued";
     case RunState::RUNNING: return "running";
     case RunState::ABORTED: return "aborted";
     case RunState::FAILED: return "failed";
@@ -44,10 +50,10 @@ std::string to_string(const RunState& rs) {
 }
 
 
-Run::Run(std::string name, ParamMap pm, kj::Path&& rootPath) :
+Run::Run(std::string name, uint num, ParamMap pm, kj::Path&& rootPath) :
     result(RunState::SUCCESS),
-    lastResult(RunState::UNKNOWN),
     name(name),
+    build(num),
     params(kj::mv(pm)),
     queuedAt(time(nullptr)),
     rootPath(kj::mv(rootPath)),
@@ -84,7 +90,7 @@ static void setEnvFromFile(const kj::Path& rootPath, kj::Path file) {
     }
 }
 
-kj::Promise<RunState> Run::start(uint buildNum, std::shared_ptr<Context> ctx, const kj::Directory &fsHome, std::function<kj::Promise<int>(kj::Maybe<pid_t>&)> getPromise)
+kj::Promise<RunState> Run::start(RunState lastResult, std::shared_ptr<Context> ctx, const kj::Directory &fsHome, std::function<kj::Promise<int>(kj::Maybe<pid_t>&)> getPromise)
 {
     kj::Path cfgDir{"cfg"};
 
@@ -131,7 +137,7 @@ kj::Promise<RunState> Run::start(uint buildNum, std::shared_ptr<Context> ctx, co
             PATH.append(p);
         }
 
-        std::string runNumStr = std::to_string(buildNum);
+        std::string runNumStr = std::to_string(build);
 
         setenv("PATH", PATH.c_str(), true);
         setenv("RUN", runNumStr.c_str(), true);
@@ -152,14 +158,26 @@ kj::Promise<RunState> Run::start(uint buildNum, std::shared_ptr<Context> ctx, co
         // enough. Instead, we'll just exec ourselves and handle that in laminard's
         // main() by calling leader_main()
         char* procName;
-        asprintf(&procName, "{laminar} %s:%d", name.data(), buildNum);
-        execl("/proc/self/exe", procName, NULL); // does not return
+        if(asprintf(&procName, "{laminar} %s:%d", name.data(), build) > 0)
+#if defined(__FreeBSD__)
+        {
+            int  sysctl_rq[] = {CTL_KERN, KERN_PROC, KERN_PROC_PATHNAME, -1};
+            size_t self_exe_len = PATH_MAX;
+            char self_exe[PATH_MAX];
+
+            if (sysctl(sysctl_rq, 4, self_exe, &self_exe_len, NULL, 0))
+                _exit(EXIT_FAILURE);
+
+            execl(self_exe, procName, NULL); // does not return
+        }
+#else
+            execl("/proc/self/exe", procName, NULL); // does not return
+#endif
         _exit(EXIT_FAILURE);
     }
 
     // All good, we've "started"
     startedAt = time(nullptr);
-    build = buildNum;
     context = ctx;
 
     output_fd = plog[0];

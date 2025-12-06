@@ -12,11 +12,11 @@ See [the website](https://laminar.ohwg.net) and the [documentation](https://lami
 
 First install development packages for `capnproto (version 0.7.0 or newer)`, `rapidjson`, `sqlite` and `boost` (for the header-only `multi_index_container` library) from your distribution's repository or other source.
 
-On Debian Buster, this can be done with:
+On Debian Bookworm, this can be done with:
 
 ```bash
-sudo apt install \
-		 capnproto cmake g++ libboost-dev libcapnp-dev libsqlite-dev libsqlite3-dev make rapidjson-dev zlib1g-dev
+sudo apt install capnproto cmake g++ libboost-dev libcapnp-dev libsqlite3-dev \
+  make rapidjson-dev zlib1g-dev pkg-config
 ```
 
 Then compile and install laminar with:
@@ -24,8 +24,9 @@ Then compile and install laminar with:
 ```bash
 git clone https://github.com/ohwgiles/laminar.git
 cd laminar
-cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/
-make -j4
+cmake -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=/usr
+make -j "$(nproc)"
+# Warning: the following will overwrite an existing /etc/laminar.conf
 sudo make install
 ```
 

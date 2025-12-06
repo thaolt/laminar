@@ -1,5 +1,5 @@
 ///
-/// Copyright 2019 Oliver Giles
+/// Copyright 2019-2022 Oliver Giles
 ///
 /// This file is part of Laminar
 ///
@@ -19,32 +19,40 @@
 #ifndef LAMINAR_FIXTURE_H_
 #define LAMINAR_FIXTURE_H_
 
-#include <capnp/rpc-twoparty.h>
-#include <gtest/gtest.h>
 #include "laminar.capnp.h"
 #include "eventsource.h"
 #include "tempdir.h"
 #include "laminar.h"
+#include "log.h"
 #include "server.h"
 #include "conf.h"
+
+#include <capnp/rpc-twoparty.h>
+#include <gtest/gtest.h>
 
 class LaminarFixture : public ::testing::Test {
 public:
     LaminarFixture() {
-        bind_rpc = std::string("unix:/") + tmp.path.toString(true).cStr() + "/rpc.sock";
-        bind_http = std::string("unix:/") + tmp.path.toString(true).cStr() + "/http.sock";
         home = tmp.path.toString(true).cStr();
-        tmp.fs->openSubdir(kj::Path{"cfg", "jobs"}, kj::WriteMode::CREATE | kj::WriteMode::CREATE_PARENT);
+        bind_rpc = std::string("unix:/") + home + "/rpc.sock";
+        bind_http = std::string("unix:/") + home + "/http.sock";
         settings.home = home.c_str();
         settings.bind_rpc = bind_rpc.c_str();
         settings.bind_http = bind_http.c_str();
         settings.archive_url = "/test-archive/";
+    }
+    ~LaminarFixture() noexcept(true) {}
+
+    void SetUp() override {
+        tmp.init();
         server = new Server(*ioContext);
         laminar = new Laminar(*server, settings);
     }
-    ~LaminarFixture() noexcept(true) {
+
+    void TearDown() override {
         delete server;
         delete laminar;
+        tmp.clean();
     }
 
     kj::Own<EventSource> eventSource(const char* path) {
@@ -90,6 +98,14 @@ public:
         return { res.getResult(), kj::mv(log) };
     }
 
+    void setNumExecutors(int nexec) {
+        KJ_IF_MAYBE(f, tmp.fs->tryOpenFile(kj::Path{"cfg", "contexts", "default.conf"},
+                kj::WriteMode::CREATE | kj::WriteMode::MODIFY | kj::WriteMode::CREATE_PARENT)) {
+            std::string content = "EXECUTORS=" + std::to_string(nexec);
+            (*f)->writeAll(content);
+        }
+    }
+
     kj::String stripLaminarLogLines(const kj::String& str) {
         auto out = kj::heapString(str.size());
         char *o = out.begin();
@@ -108,7 +124,7 @@ public:
     StringMap parseFromString(kj::StringPtr content) {
         char tmp[16] = "/tmp/lt.XXXXXX";
         int fd = mkstemp(tmp);
-        write(fd, content.begin(), content.size());
+        LSYSCALL(write(fd, content.begin(), content.size()));
         close(fd);
         StringMap map = parseConfFile(tmp);
         unlink(tmp);
